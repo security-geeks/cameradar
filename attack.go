@@ -1,18 +1,13 @@
 package cameradar
 
 import (
+	"errors"
 	"fmt"
+	"net/http"
+	"strings"
 	"time"
 
 	"github.com/Ullaakut/go-curl"
-)
-
-// HTTP responses.
-const (
-	httpOK           = 200
-	httpUnauthorized = 401
-	httpForbidden    = 403
-	httpNotFound     = 404
 )
 
 // CURL RTSP request types.
@@ -72,7 +67,8 @@ func (s *Scanner) Attack(targets []Stream) ([]Stream, error) {
 // ValidateStreams tries to setup the stream to validate whether or not it is available.
 func (s *Scanner) ValidateStreams(targets []Stream) []Stream {
 	for i := range targets {
-		targets[i].Available = s.validateStream(targets[i])
+		err := s.validateStream(targets[i])
+		targets[i].Available = (err == nil)
 		time.Sleep(s.attackInterval)
 	}
 
@@ -145,17 +141,35 @@ func (s *Scanner) DetectAuthMethods(targets []Stream) []Stream {
 }
 
 func (s *Scanner) attackCameraCredentials(target Stream, resChan chan<- Stream) {
+	consecutiveErrors := 0
+	maxConsecutiveErrors := 5 // Stop after 5 consecutive connection failures
+
 	for _, username := range s.credentials.Usernames {
 		for _, password := range s.credentials.Passwords {
-			ok := s.credAttack(target, username, password)
-			if ok {
+			err := s.credAttack(target, username, password)
+			if err != nil {
+				switch {
+				case errors.Is(err, ErrConnection):
+					consecutiveErrors++
+					if consecutiveErrors >= maxConsecutiveErrors {
+						s.term.Errorf("Stream %s: Too many consecutive connection failures (%d), server may be blocking requests", GetCameraRTSPURL(target), consecutiveErrors)
+						break
+					}
+				default:
+					consecutiveErrors = 0 // Reset on non-connection errors
+				}
+
+				time.Sleep(s.attackInterval)
+			} else {
 				target.CredentialsFound = true
 				target.Username = username
 				target.Password = password
 				resChan <- target
 				return
 			}
-			time.Sleep(s.attackInterval)
+		}
+		if consecutiveErrors >= maxConsecutiveErrors {
+			break // Exit outer loop as well
 		}
 	}
 
@@ -167,21 +181,38 @@ func (s *Scanner) attackCameraRoute(target Stream, resChan chan<- Stream) {
 	// If the stream responds positively to the dummy route, it means
 	// it doesn't require (or respect the RFC) a route and the attack
 	// can be skipped.
-	ok := s.routeAttack(target, dummyRoute)
-	if ok {
+	err := s.routeAttack(target, dummyRoute)
+	if err == nil {
 		target.RouteFound = true
 		target.Routes = append(target.Routes, "/")
 		resChan <- target
 		return
 	}
 
+	consecutiveErrors := 0
+	maxConsecutiveErrors := 5 // Stop after 5 consecutive connection failures
+
 	// Otherwise, bruteforce the routes.
 	for _, route := range s.routes {
-		ok := s.routeAttack(target, route)
-		if ok {
+		err := s.routeAttack(target, route)
+		if err != nil {
+			switch {
+			case errors.Is(err, ErrConnection):
+				// Track consecutive connection errors
+				consecutiveErrors++
+				if consecutiveErrors >= maxConsecutiveErrors {
+					s.term.Errorf("Stream %s: Too many consecutive errors (%d), server may be blocking requests", GetCameraRTSPURL(target), consecutiveErrors)
+					break
+				}
+			default:
+				consecutiveErrors = 0 // Reset on non-connection errors
+			}
+		} else {
 			target.RouteFound = true
 			target.Routes = append(target.Routes, route)
+			consecutiveErrors = 0 // Reset on success
 		}
+
 		time.Sleep(s.attackInterval)
 	}
 
@@ -191,11 +222,12 @@ func (s *Scanner) attackCameraRoute(target Stream, resChan chan<- Stream) {
 func (s *Scanner) detectAuthMethod(stream Stream) int {
 	c := s.curl.Duphandle()
 
+	route := normalizeRoute(stream.Route())
 	attackURL := fmt.Sprintf(
 		"rtsp://%s:%d/%s",
 		stream.Address,
 		stream.Port,
-		stream.Route(),
+		route,
 	)
 
 	s.setCurlOptions(c)
@@ -204,6 +236,8 @@ func (s *Scanner) detectAuthMethod(stream Stream) int {
 	_ = c.Setopt(curl.OPT_URL, attackURL)
 	// Set the RTSP STREAM URI as the stream URL.
 	_ = c.Setopt(curl.OPT_RTSP_STREAM_URI, attackURL)
+	// Add Accept header for proper SDP negotiation with strict RTSP servers
+	_ = c.Setopt(curl.OPT_HTTPHEADER, []string{"Accept: application/sdp"})
 	_ = c.Setopt(curl.OPT_RTSP_REQUEST, rtspDescribe)
 
 	// Perform the request.
@@ -226,14 +260,15 @@ func (s *Scanner) detectAuthMethod(stream Stream) int {
 	return authType.(int)
 }
 
-func (s *Scanner) routeAttack(stream Stream, route string) bool {
+func (s *Scanner) routeAttack(stream Stream, route string) error {
 	c := s.curl.Duphandle()
 
+	normalizedRoute := normalizeRoute(route)
 	attackURL := fmt.Sprintf(
 		"rtsp://%s:%d/%s",
 		stream.Address,
 		stream.Port,
-		route,
+		normalizedRoute,
 	)
 
 	s.setCurlOptions(c)
@@ -247,41 +282,55 @@ func (s *Scanner) routeAttack(stream Stream, route string) bool {
 	_ = c.Setopt(curl.OPT_URL, attackURL)
 	// Set the RTSP STREAM URI as the stream URL.
 	_ = c.Setopt(curl.OPT_RTSP_STREAM_URI, attackURL)
+	// Add Accept header for proper SDP negotiation with strict RTSP servers
+	_ = c.Setopt(curl.OPT_HTTPHEADER, []string{"Accept: application/sdp"})
 	_ = c.Setopt(curl.OPT_RTSP_REQUEST, rtspDescribe)
 
 	// Perform the request.
 	err := c.Perform()
 	if err != nil {
-		s.term.Errorf("Perform failed for %q (auth %d): %v", attackURL, stream.AuthenticationType, err)
-		return false
+		// Check if it's a connection error (reset, timeout, etc.)
+		if isConnectionError(err) {
+			return fmt.Errorf("%w: %w", ErrConnection, err)
+		}
+		if !s.verbose {
+			s.term.Errorf("Perform failed for %q (auth %d): %v", attackURL, stream.AuthenticationType, err)
+		}
+		return err
 	}
 
 	// Get return code for the request.
 	rc, err := c.Getinfo(curl.INFO_RESPONSE_CODE)
 	if err != nil {
 		s.term.Errorf("Getinfo failed: %v", err)
-		return false
+		return err
 	}
 
 	if s.debug {
 		s.term.Debugln("DESCRIBE", attackURL, "RTSP/1.0 >", rc)
 	}
+
 	// If it's a 401 or 403, it means that the credentials are wrong but the route might be okay.
 	// If it's a 200, the stream is accessed successfully.
-	if rc == httpOK || rc == httpUnauthorized || rc == httpForbidden {
-		return true
+	switch rc {
+	case http.StatusOK, http.StatusUnauthorized, http.StatusForbidden:
+		return nil
+	case http.StatusServiceUnavailable:
+		return fmt.Errorf("%w: service unavailable (503): server may be rate-limiting", ErrConnection)
+	default:
+		return fmt.Errorf("unexpected response: %d", rc)
 	}
-	return false
 }
 
-func (s *Scanner) credAttack(stream Stream, username string, password string) bool {
+func (s *Scanner) credAttack(stream Stream, username string, password string) error {
 	c := s.curl.Duphandle()
 
+	route := normalizeRoute(stream.Route())
 	attackURL := fmt.Sprintf(
 		"rtsp://%s:%d/%s",
 		stream.Address,
 		stream.Port,
-		stream.Route(),
+		route,
 	)
 
 	s.setCurlOptions(c)
@@ -295,42 +344,56 @@ func (s *Scanner) credAttack(stream Stream, username string, password string) bo
 	_ = c.Setopt(curl.OPT_URL, attackURL)
 	// Set the RTSP STREAM URI as the stream URL.
 	_ = c.Setopt(curl.OPT_RTSP_STREAM_URI, attackURL)
+	// Add Accept header for proper SDP negotiation with strict RTSP servers
+	_ = c.Setopt(curl.OPT_HTTPHEADER, []string{"Accept: application/sdp"})
 	_ = c.Setopt(curl.OPT_RTSP_REQUEST, rtspDescribe)
 
 	// Perform the request.
 	err := c.Perform()
 	if err != nil {
-		s.term.Errorf("Perform failed for %q (auth %d): %v", attackURL, stream.AuthenticationType, err)
-		return false
+		// Check if it's a connection error (reset, timeout, etc.)
+		if isConnectionError(err) {
+			return fmt.Errorf("connection error: %w", err)
+		}
+		if !s.verbose {
+			s.term.Errorf("Perform failed for %q (auth %d): %v", attackURL, stream.AuthenticationType, err)
+		}
+		return err
 	}
 
 	// Get return code for the request.
 	rc, err := c.Getinfo(curl.INFO_RESPONSE_CODE)
 	if err != nil {
 		s.term.Errorf("Getinfo failed: %v", err)
-		return false
+		return err
 	}
 
 	if s.debug {
 		s.term.Debugln("DESCRIBE", attackURL, "RTSP/1.0 >", rc)
 	}
 
+	switch rc {
 	// If it's a 404, it means that the route is incorrect but the credentials might be okay.
 	// If it's a 200, the stream is accessed successfully.
-	if rc == httpOK || rc == httpNotFound {
-		return true
+	case http.StatusOK, http.StatusNotFound:
+		return nil
+	case http.StatusServiceUnavailable:
+		return fmt.Errorf("service unavailable (503): server may be rate-limiting")
+	default:
+		return fmt.Errorf("unexpected response: %d", rc)
 	}
-	return false
+
 }
 
-func (s *Scanner) validateStream(stream Stream) bool {
+func (s *Scanner) validateStream(stream Stream) error {
 	c := s.curl.Duphandle()
 
+	route := normalizeRoute(stream.Route())
 	attackURL := fmt.Sprintf(
 		"rtsp://%s:%d/%s",
 		stream.Address,
 		stream.Port,
-		stream.Route(),
+		route,
 	)
 
 	s.setCurlOptions(c)
@@ -352,14 +415,14 @@ func (s *Scanner) validateStream(stream Stream) bool {
 	err := c.Perform()
 	if err != nil {
 		s.term.Errorf("Perform failed for %q (auth %d): %v", attackURL, stream.AuthenticationType, err)
-		return false
+		return err
 	}
 
 	// Get return code for the request.
 	rc, err := c.Getinfo(curl.INFO_RESPONSE_CODE)
 	if err != nil {
 		s.term.Errorf("Getinfo failed: %v", err)
-		return false
+		return err
 	}
 
 	if s.debug {
@@ -367,10 +430,12 @@ func (s *Scanner) validateStream(stream Stream) bool {
 	}
 
 	// If it's a 200, the stream is accessed successfully.
-	if rc == httpOK {
-		return true
+	switch rc {
+	case http.StatusOK:
+		return nil
+	default:
+		return fmt.Errorf("unexpected response: %d", rc)
 	}
-	return false
 }
 
 func (s *Scanner) setCurlOptions(c Curler) {
@@ -389,6 +454,34 @@ func (s *Scanner) setCurlOptions(c Curler) {
 	} else {
 		_ = c.Setopt(curl.OPT_VERBOSE, 0)
 	}
+}
+
+var ErrConnection = errors.New("connection error")
+
+var connectionErrorSubstrings = []string{
+	"connection reset",
+	"recv failure",
+	"timeout",
+	"connection refused",
+	"broken pipe",
+	"cseq",
+	"503", // service unavailable / possible rate limiting
+	"service unavailable",
+}
+
+// isConnectionError reports whether err looks like a connection-related error.
+func isConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	msg := strings.ToLower(err.Error())
+	for _, needle := range connectionErrorSubstrings {
+		if strings.Contains(msg, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 // HACK: See https://stackoverflow.com/questions/3572397/lib-curl-in-c-disable-printing
